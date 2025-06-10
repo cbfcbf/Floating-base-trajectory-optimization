@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>FloatingBaseTrajectoryOptimization</name>
+  <name>trajectory_optimization</name>
   <version>0.0.0</version>
   <description>Example of using Pinocchio in a C++ based ROS 2 package.</description>
   <maintainer email="cbfcbf.byron@gmail.com">Bofan Chen</maintainer>
