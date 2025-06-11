@@ -3,12 +3,15 @@
 #include <pinocchio/algorithm/centroidal.hpp>
 #include <pinocchio/algorithm/rnea.hpp>
 #include <pinocchio/algorithm/crba.hpp>
+#include <pinocchio/algorithm/aba.hpp>
 #include <pinocchio/algorithm/frames.hpp>
-#include <ifopt/ipopt_solver.h>
-#include <ifopt/problem.h>
+
+
 #include <ifopt/constraint_set.h>
 #include <ifopt/cost_term.h>
 #include <ifopt/variable_set.h>
+#include <ifopt/problem.h>
+#include <ifopt/ipopt_solver.h>
 #include <Eigen/Dense>
 #include <iostream>
 #include <memory>
@@ -25,7 +28,10 @@ const double total_time = dt * (N-1);  // 总时间
 // 机器人模型
 Model model;
 Data data(model);
-int g_nq, g_nv, g_na;  // 位置变量数、速度变量数、执行器数量
+pinocchio::container::aligned_vector<pinocchio::Force> f_ext(model.njoints);
+int g_nq, g_nv, g_na,g_nf;  // 位置变量数、速度变量数、执行器数量
+
+// VectorXd u_k_full = VectorXd::Zero(model.nv); 
 
 // 初始化机器人模型
 void initRobotModel(const std::string& urdf_path) {
@@ -33,7 +39,7 @@ void initRobotModel(const std::string& urdf_path) {
     pinocchio::urdf::buildModel(urdf_path, 
                                JointModelFreeFlyer(), 
                                model);
-    model.gravity.setZero();  // 在轨迹优化中通常忽略重力
+    // model.gravity.setZero();  // 在轨迹优化中通常忽略重力
     
     // 创建数据对象
     data = Data(model);
@@ -42,21 +48,22 @@ void initRobotModel(const std::string& urdf_path) {
     g_nq = model.nq;   // 位置变量数 (浮动基座 + 关节角度)
     g_nv = model.nv;   // 速度变量数
     g_na = g_nv - 6;     // 执行器数量 (减去浮动基座的6个自由度)
-    
+    g_nf = 12;
+
     std::cout << "Robot model loaded: " << urdf_path << "\n";
-    std::cout << "Total DOFs: " << g_nv << " (Actuated: " << g_na << ")\n";
+    std::cout <<"nq: " << g_nq << " nv: " << g_nv << " (Actuated: " << g_na << ")\n";
 }
 
 // 轨迹变量集
-class TrajectoryVariables : public VariableSet {
+class StateVariables : public VariableSet {
 public:
-    TrajectoryVariables() : TrajectoryVariables("trajectory") {}
+    StateVariables() : StateVariables("state") {}
     
-    TrajectoryVariables(const std::string& name) 
+    StateVariables(const std::string& name) 
         : VariableSet((g_nq + g_nv) * N, name)  // 每个时间点有位置和速度
     {
         // 初始化轨迹为0
-        values_ = VectorXd::Zero(GetRows());
+        values_ = VectorXd::Ones(GetRows());
     }
     
     void SetVariables(const VectorXd& x) override {
@@ -72,10 +79,10 @@ public:
         return values_.segment(k * (g_nq + g_nv), g_nq + g_nv);
     }
     
-    // 设置状态
-    void setState(int k, const VectorXd& state) {
-        values_.segment(k * (g_nq + g_nv), g_nq + g_nv) = state;
-    }
+    // // 设置状态
+    // void setState(int k, const VectorXd& state) {
+    //     values_.segment(k * (g_nq + g_nv), g_nq + g_nv) = state;
+    // }
     
     // 获取位置
     Eigen::VectorBlock<const Eigen::VectorXd> getPosition(int k) const {
@@ -124,242 +131,189 @@ private:
     VectorXd values_;
 };
 
+class InputVariables : public VariableSet {
+public:
+    InputVariables() : InputVariables("input") {}
+    
+    InputVariables(const std::string& name) 
+        : VariableSet((g_na+g_nf) * (N-1), name)  // 每个时间点有g_na个执行器输入
+    {
+        // 初始化输入为0
+        values_ = VectorXd::Zero(GetRows());
+    }
+    
+    void SetVariables(const VectorXd& x) override {
+        values_ = x;
+    }
+    
+    VectorXd GetValues() const override {
+        return values_;
+    }
+    
+    VecBound GetBounds() const override {
+        VecBound bounds(GetRows());
+        
+        // 设置执行器输入边界 (假设无约束)
+        for (int i = 0; i < GetRows(); i++) {
+            bounds[i] = NoBound;
+        }
+        
+        return bounds;
+    }
+    // 获取特定时间点的输入
+    Eigen::VectorBlock<const Eigen::VectorXd> getTorqueInput(int k) const {
+        return values_.segment(k * (g_na+g_nf), g_na);
+    }
+    // 获取特定时间点的f输入
+    Eigen::VectorBlock<const Eigen::VectorXd> getExtfInput(int k) const {
+        return values_.segment(k * (g_na+g_nf) + g_na, g_nf);
+    }
+
+private:
+    VectorXd values_;
+};
+
+
 // 动力学约束
 class DynamicsConstraint : public ConstraintSet {
 public:
     DynamicsConstraint() : DynamicsConstraint("dynamics") {}
     
     DynamicsConstraint(const std::string& name)
-        : ConstraintSet(g_nv * (N-1), name)  // 每个时间点有nv个约束
+        : ConstraintSet((g_nv+g_nq) * (N-1), name)  // 每个时间点有nv个约束
     {}
     
     VectorXd GetValues() const override {
         VectorXd g(GetRows());
-        auto var = std::dynamic_pointer_cast<TrajectoryVariables>(GetVariables()->GetComponent("trajectory"));
-        
+        auto state_var = std::dynamic_pointer_cast<StateVariables>(GetVariables()->GetComponent("state"));
+        auto input_var = std::dynamic_pointer_cast<InputVariables>(GetVariables()->GetComponent("input"));
+
+
         // 遍历所有时间点 (k=0 到 k=N-2)
         for (int k = 0; k < N-1; k++) {
             // 获取当前和下一个状态
-            VectorXd q_k = var->getPosition(k);
-            VectorXd v_k = var->getVelocity(k);
-            VectorXd q_k1 = var->getPosition(k+1);
-            VectorXd v_k1 = var->getVelocity(k+1);
+            VectorXd q_k = state_var->getPosition(k);
+            VectorXd v_k = state_var->getVelocity(k);
+            VectorXd q_k1 = state_var->getPosition(k+1);
+            VectorXd v_k1 = state_var->getVelocity(k+1);
+            VectorXd u_k = input_var->getTorqueInput(k);
+            VectorXd f_k = input_var->getExtfInput(k);
+
+            // 归一化四元数部分
+            q_k.segment<4>(3).normalize();
+            q_k1.segment<4>(3).normalize();
+
+            //  // 重置外部力
+            for(auto& f : f_ext) f.setZero();
+
+            // 设置局部坐标系的力
+            const int lframe_id = model.getFrameId("lleg_link6");
+            const int ljoint_id = model.frames[lframe_id].parent;
+            f_ext[ljoint_id].linear() = f_k.segment<3>(0);
+            f_ext[ljoint_id].angular() = f_k.segment<3>(3);
+
+            const int rframe_id = model.getFrameId("rleg_link6");
+            const int rjoint_id = model.frames[rframe_id].parent;
+            f_ext[rjoint_id].linear() = f_k.segment<3>(6);
+            f_ext[rjoint_id].angular() = f_k.segment<3>(9);
+
+            // // 计算动力学
+            VectorXd u_k_full= VectorXd::Zero( model.nv); // 执行器输入向量，前6个为浮动基座的输入
+
+            u_k_full.head(6).setZero();
+            u_k_full.tail(g_na) = u_k;  // 填充执行器输入
+
+            q_k.segment<4>(3).normalize();
+            q_k1.segment<4>(3).normalize();
+            VectorXd a_k = pinocchio::aba(model, data, q_k, v_k, u_k_full,f_ext);
+            // VectorXd a_k=VectorXd::Zero(g_nv);
+            q_k.segment<4>(3).normalize();
+            q_k1.segment<4>(3).normalize();
+
+            // 计算动力学约束(forward euler)
+            VectorXd q_diff = q_k1 - pinocchio::integrate(model, q_k, v_k1 * dt);  // 使用Pinocchio的积分器
+            // VectorXd q_diff=VectorXd::Zero(g_nq);
+            VectorXd v_diff = v_k1 - v_k - a_k * dt;  // 速度差
+            // VectorXd v_diff=VectorXd::Zero(g_nv);
             
-            // 计算加速度 (v_k1 = v_k + a_k * dt)
-            VectorXd a_k = (v_k1 - v_k) / dt;
-            
-            // 计算逆动力学 (计算力矩)
-            VectorXd tau = rnea(model, data, q_k, v_k, a_k);
-            
-            // 浮动基座没有执行器，所以执行器力矩为0
-            tau.head(6).setZero();
-            
-            // 动力学约束: M*a + C + g = tau
-            // 由于浮动基座，前6个元素应为0
-            g.segment(k * g_nv, g_nv) = tau;
+            // 将位置和速度差存入g
+            g.segment(k * (g_nv + g_nq), g_nq) = q_diff;
+            g.segment(k * (g_nv + g_nq) + g_nq, g_nv) = v_diff;
         }
         
         return g;
     }
-    
     VecBound GetBounds() const override {
         VecBound bounds(GetRows());
         
-        // 浮动基座动力学约束应为0 (无执行器)
-        for (int k = 0; k < N-1; k++) {
-            // 前6个自由度 (浮动基座) 必须为0
-            for (int i = 0; i < 6; i++) {
-                bounds[k*g_nv+i] = Bounds(0.0, 0.0);
-            }
-            
-            // 关节力矩可以有边界 (这里设为无约束)
-            for (int i = 6; i < g_nv; i++) {
-                bounds[k*g_nv+i] = NoBound;
-            }
+        // 设置执行器输入边界 (假设无约束)
+        for (int i = 0; i < GetRows(); i++) {
+            bounds[i] = Bounds(0.0, 0.0);  // 等式约束
         }
         
         return bounds;
     }
     
-    void FillJacobianBlock(std::string var_set, Jacobian& jac) const override {
-        if (var_set == "trajectory") {
-            auto var = std::dynamic_pointer_cast<TrajectoryVariables>(GetVariables()->GetComponent("trajectory"));
-            
-            // 为雅可比矩阵预留空间
-            jac.reserve(g_nv * (N-1) * (g_nq+g_nv) * 2);
-            
-            // 数值计算雅可比矩阵
-            double eps = 1e-6;
-            VectorXd x0 = var->GetValues();
-            VectorXd g0 = GetValues();
-            
-            for (int i = 0; i < x0.size(); i++) {
-                VectorXd x = x0;
-                x(i) += eps;
-                var->SetVariables(x);
-                VectorXd g_pert = GetValues();
-                
-                for (int j = 0; j < g0.size(); j++) {
-                    double deriv = (g_pert(j) - g0(j)) / eps;
-                    if (std::abs(deriv) > 1e-8) {
-                        jac.coeffRef(j, i) = deriv;
-                    }
-                }
-            }
-            
-            // 恢复原始值
-            var->SetVariables(x0);
-        }
-    }
+    void FillJacobianBlock(std::string var_set, Jacobian& jac) const override {}
+
 };
 
-// // 初始状态约束
-// class InitialStateConstraint : public ConstraintSet {
+// class QuaternionConstraint : public ifopt::ConstraintSet {
 // public:
-//     InitialStateConstraint(const VectorXd& q0, const VectorXd& v0)
-//         : InitialStateConstraint("initial_state", q0, v0) {}
-    
-//     InitialStateConstraint(const std::string& name, 
-//                           const VectorXd& q0, const VectorXd& v0)
-//         : ConstraintSet(nq + nv, name), q0_(q0), v0_(v0)
-//     {}
+//     QuaternionConstraint() : ConstraintSet(1, "quaternion_norm") {}
     
 //     VectorXd GetValues() const override {
-//         auto var = std::dynamic_pointer_cast<TrajectoryVariables>(GetVariables()->GetComponent("trajectory"));
-        
-//         VectorXd state = var->getState(0);
-//         VectorXd q = state.head(nq);
-//         VectorXd v = state.tail(nv);
-        
-//         VectorXd g(nq + nv);
-//         g.head(nq) = q - q0_;
-//         g.tail(nv) = v - v0_;
-        
-//         return g;
+//         VectorXd q = GetVariables()->GetComponent("state")->getPosition();
+//         VectorXd value(1);
+//         value(0) = q.squaredNorm() - 1.0; // w²+x²+y²+z²-1
+//         return value;
 //     }
     
 //     VecBound GetBounds() const override {
-//         VecBound bounds(nq + nv);
-//         for (int i = 0; i < nq + nv; i++) {
-//             bounds[i] = Bounds(0.0, 0.0);
-//         }
+//         VecBound bounds(1);
+//         bounds.at(0) = ifopt::Bounds(0.0, 0.0); // 等式约束
 //         return bounds;
 //     }
     
-//     void FillJacobianBlock(std::string var_set, Jacobian& jac) const override {
-//         if (var_set == "trajectory") {
-//             // 只有第一个状态点有非零雅可比
-//             for (int i = 0; i < nq + nv; i++) {
-//                 jac.coeffRef(i, i) = 1.0;
+//     void FillJacobianBlock(std::string var_set, Jacobian& jac_block) const override {
+//         if (var_set == "quaternion") {
+//             VectorXd q = GetVariables()->GetComponent("quaternion")->GetValues();
+//             for (int i=0; i<4; ++i) {
+//                 jac_block.coeffRef(0, i) = 2.0 * q(i);
 //             }
 //         }
 //     }
-
-// private:
-//     VectorXd q0_, v0_;
 // };
 
-// // 目标位置约束
-// class TargetPositionConstraint : public ConstraintSet {
-// public:
-//     TargetPositionConstraint(int frame_id, const Vector3d& target_pos)
-//         : TargetPositionConstraint("target_position", frame_id, target_pos) {}
-    
-//     TargetPositionConstraint(const std::string& name, 
-//                             int frame_id, const Vector3d& target_pos)
-//         : ConstraintSet(3, name), frame_id_(frame_id), target_pos_(target_pos)
-//     {}
-    
-//     VectorXd GetValues() const override {
-//         auto var = std::dynamic_pointer_cast<TrajectoryVariables>(GetVariables()->GetComponent("trajectory"));
-        
-//         // 获取最终位置
-//         VectorXd q_final = var->getPosition(N-1);
-        
-//         // 计算末端执行器位置
-//         updateFramePlacement(model, data, frame_id_);
-//         Vector3d pos = data.oMf[frame_id_].translation();
-        
-//         return pos - target_pos_;
-//     }
-    
-//     VecBound GetBounds() const override {
-//         VecBound bounds(3);
-//         for (int i = 0; i < 3; i++) {
-//             bounds[i] = Bounds(0.0, 0.0);
-//         }
-//         return bounds;
-//     }
-
-// private:
-//     int frame_id_;
-//     Vector3d target_pos_;
-// };
-
-// 平滑性成本函数
-class SmoothnessCost : public CostTerm {
+// 成本函数
+class RefCost : public CostTerm {
 public:
-    SmoothnessCost() : SmoothnessCost("smoothness") {}
+    RefCost() : RefCost("reference") {}
     
-    SmoothnessCost(const std::string& name) : CostTerm(name) {}
+    RefCost(const std::string& name) : CostTerm(name) {}
     
     double GetCost() const override {
         double cost = 0.0;
-        auto var = std::dynamic_pointer_cast<TrajectoryVariables>(GetVariables()->GetComponent("trajectory"));
+        auto state_var = std::dynamic_pointer_cast<StateVariables>(GetVariables()->GetComponent("state"));
+        auto input_var = std::dynamic_pointer_cast<InputVariables>(GetVariables()->GetComponent("input"));
         
-        // 最小化加速度
-        for (int k = 0; k < N-1; k++) {
-            VectorXd v_k = var->getVelocity(k);
-            VectorXd v_k1 = var->getVelocity(k+1);
-            VectorXd a_k = (v_k1 - v_k) / dt;
-            
-            cost += a_k.squaredNorm();
+        //最小化state
+        for (int k = 0; k < N; k++) {
+            VectorXd state = state_var->getState(k);
+            // 计算状态的L2范数
+            cost += state.squaredNorm();
         }
-        
-        // 最小化力矩变化
-        for (int k = 1; k < N-1; k++) {
-            // 计算力矩 (简化的)
-            VectorXd q_k = var->getPosition(k);
-            VectorXd v_k = var->getVelocity(k);
-            VectorXd v_k1 = var->getVelocity(k+1);
-            VectorXd a_k = (v_k1 - v_k) / dt;
-            
-            VectorXd tau_k = rnea(model, data, q_k, v_k, a_k).tail(g_na);
-            
-            // 上一个时间点的力矩
-            VectorXd q_km1 = var->getPosition(k-1);
-            VectorXd v_km1 = var->getVelocity(k-1);
-            VectorXd a_km1 = (v_k - v_km1) / dt;
-            VectorXd tau_km1 = rnea(model, data, q_km1, v_km1, a_km1).tail(g_na);
-            
-            cost += (tau_k - tau_km1).squaredNorm();
+        //最小化输入
+        for (int k = 0; k < N-1; k++) {
+            VectorXd input = input_var->getTorqueInput(k);
+            // 计算输入的L2范数
+            cost += input.squaredNorm();
         }
         
         return cost;
     }
     
-    void FillJacobianBlock(std::string var_set, Jacobian& jac) const override {
-        // 数值计算梯度
-        if (var_set == "trajectory") {
-            double eps = 1e-6;
-            auto var = std::dynamic_pointer_cast<TrajectoryVariables>(GetVariables()->GetComponent("trajectory"));
-            
-            VectorXd x0 = var->GetValues();
-            double cost0 = GetCost();
-            
-            for (int i = 0; i < x0.size(); i++) {
-                VectorXd x = x0;
-                x(i) += eps;
-                var->SetVariables(x);
-                double cost_pert = GetCost();
-                
-                jac.coeffRef(0, i) = (cost_pert - cost0) / eps;
-            }
-            
-            // 恢复原始值
-            var->SetVariables(x0);
-        }
-    }
+    void FillJacobianBlock(std::string var_set, Jacobian& jac) const override {}
 };
 
 int main(int argc, char** argv) {
@@ -369,43 +323,25 @@ int main(int argc, char** argv) {
     // }
     
     // 1. 初始化机器人模型
-    initRobotModel("/home/bofan/optimization/URDFopt/orca_ydescription.urdf");
+    initRobotModel("/home/bofan/optimization/opt_ws/src/traj_opt/orca_ydescription.urdf");
     
     // 2. 创建问题实例
     Problem nlp;
     
-    // 初始状态 (零状态)
-    VectorXd q0 = VectorXd::Zero(g_nq);
-    VectorXd v0 = VectorXd::Zero(g_nv);
-    
-    // 设置浮动基座初始位置和方向
-    q0.head<3>().setZero();        // 位置
-    q0.segment<4>(3) << 0, 0, 0, 1; // 四元数 (x,y,z,w)
     
     // 创建变量集
-    auto trajectory_vars = std::make_shared<TrajectoryVariables>();
-    nlp.AddVariableSet(trajectory_vars);
+    auto state_vars = std::make_shared<StateVariables>();
+    auto input_vars = std::make_shared<InputVariables>();
+
+    nlp.AddVariableSet(state_vars);
+    nlp.AddVariableSet(input_vars);
     
     // 添加约束
-    // nlp.AddConstraintSet(std::make_shared<InitialStateConstraint>(q0, v0));
     nlp.AddConstraintSet(std::make_shared<DynamicsConstraint>());
     
-    // // 添加末端执行器目标约束 (示例：使用第一个操作链的末端)
-    // int target_frame_id = 0;
-    // for (const auto& frame : model.frames) {
-    //     if (frame.name.find("hand") != std::string::npos) {
-    //         target_frame_id = frame.id;
-    //         std::cout << "Using target frame: " << frame.name << "\n";
-    //         break;
-    //     }
-    // }
-    
-    // Vector3d target_pos(1.0, 0.5, 0.5);  // 目标位置
-    // nlp.AddConstraintSet(std::make_shared<TargetPositionConstraint>(
-    //     target_frame_id, target_pos));
     
     // 添加成本函数
-    nlp.AddCostSet(std::make_shared<SmoothnessCost>());
+    nlp.AddCostSet(std::make_shared<RefCost>());
     
     // 3. 配置求解器
     IpoptSolver ipopt;
@@ -420,7 +356,7 @@ int main(int argc, char** argv) {
     ipopt.Solve(nlp);
     
     // 5. 提取和显示结果
-    VectorXd x_opt = trajectory_vars->GetValues();
+    VectorXd x_opt = state_vars->GetValues();
     
     // 保存轨迹到文件
     std::ofstream outfile("trajectory.csv");
